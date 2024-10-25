@@ -10,6 +10,12 @@ pub struct Yin {
     sample_rate: usize,
 }
 
+#[derive(Debug)]
+pub struct PitchResult {
+    pub frequency: f64,
+    pub clarity: f64,
+}
+
 impl Yin {
     pub fn init(threshold: f64, freq_min: f64, freq_max: f64, sample_rate: usize) -> Yin {
         let tau_max = (sample_rate as f64 / freq_min).floor() as usize;
@@ -22,8 +28,11 @@ impl Yin {
         }
     }
 
-    pub fn estimate_freq(&self, audio_sample: &[f64]) -> Result<f64, Box<dyn std::error::Error>> {
-        let sample_frequency = compute_sample_frequency(
+    pub fn estimate_freq(
+        &self,
+        audio_sample: &[f64],
+    ) -> Result<PitchResult, Box<dyn std::error::Error>> {
+        let (sample_frequency, clarity) = compute_sample_frequency(
             audio_sample,
             self.tau_min,
             self.tau_max,
@@ -34,7 +43,10 @@ impl Yin {
         if sample_frequency.is_infinite() || sample_frequency.is_nan() {
             Err(Box::new(UnknownValueError {}))
         } else {
-            Ok(sample_frequency)
+            Ok(PitchResult {
+                frequency: sample_frequency,
+                clarity,
+            })
         }
     }
 }
@@ -57,7 +69,7 @@ fn diff_function(audio_sample: &[f64], tau_max: usize) -> Vec<f64> {
 
 fn cmndf(diff: &[f64]) -> Vec<f64> {
     let mut cmndf = vec![0.0; diff.len()];
-    cmndf[0] = 1.0; // Set first value to 1 by definition
+    cmndf[0] = 1.0;
     let mut running_sum = 0.0;
 
     for tau in 1..diff.len() {
@@ -72,7 +84,48 @@ fn cmndf(diff: &[f64]) -> Vec<f64> {
     cmndf
 }
 
-fn compute_diff_min(diff_fn: &[f64], min_tau: usize, max_tau: usize, harm_threshold: f64) -> f64 {
+fn calculate_clarity(diff_fn: &[f64], tau: usize, window_size: usize) -> f64 {
+    let start = tau.saturating_sub(window_size);
+    let end = std::cmp::min(tau + window_size, diff_fn.len());
+
+    if end <= start {
+        return 0.0;
+    }
+
+    let min_val = diff_fn[tau];
+    let mut mean_surrounding = 0.0;
+    let mut count = 0;
+
+    // Calculate mean of surrounding values, excluding the dip
+    for i in start..end {
+        if i != tau {
+            mean_surrounding += diff_fn[i];
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return 0.0;
+    }
+
+    mean_surrounding /= count as f64;
+
+    // Calculate clarity based on the ratio of the dip to surrounding values
+    let contrast = (mean_surrounding - min_val) / mean_surrounding;
+
+    // Apply sigmoid-like function to normalize clarity between 0 and 1
+    // and make it more sensitive to noise
+    let clarity = 1.0 / (1.0 + (-10.0 * (contrast - 0.5)).exp());
+
+    clarity
+}
+
+fn compute_diff_min(
+    diff_fn: &[f64],
+    min_tau: usize,
+    max_tau: usize,
+    harm_threshold: f64,
+) -> (f64, f64) {
     let len = diff_fn.len();
     let max_tau = std::cmp::min(max_tau, len - 1);
 
@@ -82,12 +135,12 @@ fn compute_diff_min(diff_fn: &[f64], min_tau: usize, max_tau: usize, harm_thresh
             while tau < max_tau && diff_fn[tau + 1] < diff_fn[tau] {
                 tau += 1;
             }
-            // Perform parabolic interpolation
-            return parabolic_interpolation(tau, diff_fn);
+            let clarity = calculate_clarity(diff_fn, tau, 5); // Use a window of 5 samples
+            return (parabolic_interpolation(tau, diff_fn), clarity);
         }
         tau += 1;
     }
-    // If no suitable tau found, return minimum of diff_fn
+
     let (tau_min, _) = diff_fn
         .iter()
         .enumerate()
@@ -95,7 +148,9 @@ fn compute_diff_min(diff_fn: &[f64], min_tau: usize, max_tau: usize, harm_thresh
         .take(max_tau - min_tau + 1)
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .unwrap();
-    parabolic_interpolation(tau_min, diff_fn)
+
+    let clarity = calculate_clarity(diff_fn, tau_min, 5);
+    (parabolic_interpolation(tau_min, diff_fn), clarity)
 }
 
 fn parabolic_interpolation(tau: usize, diff_fn: &[f64]) -> f64 {
@@ -125,14 +180,14 @@ pub fn compute_sample_frequency(
     tau_max: usize,
     sample_rate: usize,
     threshold: f64,
-) -> f64 {
+) -> (f64, f64) {
     let diff_fn = diff_function(audio_sample, tau_max);
     let cmndf = cmndf(&diff_fn);
-    let sample_period = compute_diff_min(&cmndf, tau_min, tau_max, threshold);
+    let (sample_period, clarity) = compute_diff_min(&cmndf, tau_min, tau_max, threshold);
     if sample_period <= 0.0 {
-        f64::INFINITY
+        (f64::INFINITY, 0.0)
     } else {
-        convert_to_frequency(sample_period, sample_rate)
+        (convert_to_frequency(sample_period, sample_rate), clarity)
     }
 }
 
@@ -140,9 +195,9 @@ pub fn compute_sample_frequency(
 mod tests {
     use dasp::{signal, Signal};
 
-    fn assert_within_tolerance(a: f64, b: f64, tolerance: f64) {
-        println!("expected: {}, actual: {}", a, b);
-        assert!((a - b).abs() < tolerance);
+    fn assert_within_tolerance(a: PitchResult, b: f64, tolerance: f64) {
+        println!("expected: {}, actual: {}", a.frequency, b);
+        assert!((a.frequency - b).abs() < tolerance);
     }
 
     fn produce_sample(sample_rate: usize, frequency: f64, noise_ratio: f64) -> Vec<f64> {
@@ -191,7 +246,7 @@ mod tests {
         let sample = produce_sample(44100, 4000.0, 0.0);
         let yin = Yin::init(0.1, 3000.0, 5000.0, 44100);
         let computed_frequency = yin.estimate_freq(&sample).unwrap();
-        let difference = computed_frequency - 4000.0;
+        let difference = computed_frequency.frequency - 4000.0;
         assert!(difference.abs() < 50.0);
     }
 
@@ -201,6 +256,32 @@ mod tests {
         let yin = Yin::init(0.1, 300.0, 500.0, 44100);
         let computed_frequency = yin.estimate_freq(&sample).unwrap();
         assert_within_tolerance(computed_frequency, 443.0, 1.0);
+    }
+
+    #[test]
+    fn test_clarity_clean_signal() {
+        let sample = produce_sample(44100, 440.0, 0.0); // Clean signal
+        let yin = Yin::init(0.1, 300.0, 500.0, 44100);
+        let result = yin.estimate_freq(&sample).unwrap();
+        assert!(result.clarity > 0.8); // Clean signal should have high clarity
+    }
+
+    #[test]
+    fn test_clarity_noisy_signal() {
+        let sample = produce_sample(44100, 440.0, 0.5); // Noisy signal
+        let yin = Yin::init(0.1, 300.0, 500.0, 44100);
+        let result = yin.estimate_freq(&sample).unwrap();
+        assert!(result.clarity < 0.8); // Noisy signal should have lower clarity
+        println!("Noisy signal clarity: {}", result.clarity);
+    }
+
+    #[test]
+    fn test_clarity_very_noisy_signal() {
+        let sample = produce_sample(44100, 440.0, 1.0); // Very noisy signal
+        let yin = Yin::init(0.1, 300.0, 500.0, 44100);
+        let result = yin.estimate_freq(&sample).unwrap();
+        assert!(result.clarity < 0.6); // Very noisy signal should have very low clarity
+        println!("Very noisy signal clarity: {}", result.clarity);
     }
 
     #[test]
