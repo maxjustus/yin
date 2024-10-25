@@ -10,7 +10,7 @@ pub struct Yin {
     sample_rate: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PitchResult {
     pub frequency: f64,
     pub clarity: f64,
