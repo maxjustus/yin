@@ -1,6 +1,7 @@
 mod errors;
 
 use errors::UnknownValueError;
+use std::f64::consts::PI;
 
 #[derive(Clone, Debug)]
 pub struct Yin {
@@ -193,11 +194,13 @@ pub fn compute_sample_frequency(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use dasp::{signal, Signal};
 
-    fn assert_within_tolerance(a: PitchResult, b: f64, tolerance: f64) {
-        println!("expected: {}, actual: {}", a.frequency, b);
-        assert!((a.frequency - b).abs() < tolerance);
+    macro_rules! assert_within_tolerance {
+        ($a:expr, $b:expr, $tolerance:expr) => {
+            assert!(($a.frequency - $b).abs() < $tolerance, "{} != {}", $a.frequency, $b);
+        };
     }
 
     fn produce_sample(sample_rate: usize, frequency: f64, noise_ratio: f64) -> Vec<f64> {
@@ -209,13 +212,39 @@ mod tests {
             .collect();
         sample
     }
-    use super::*;
+
+    fn produce_complex_sample(
+        sample_rate: usize,
+        fundamental: f64,
+        harmonics: &[(f64, f64)],
+    ) -> Vec<f64> {
+        let len = sample_rate * 2;
+        let mut sample = vec![0.0; len];
+
+        for i in 0..len {
+            let t = i as f64 / sample_rate as f64;
+            // Add fundamental
+            sample[i] = (2.0 * PI * fundamental * t).sin();
+
+            // Add harmonics
+            for (multiple, amplitude) in harmonics {
+                sample[i] += amplitude * (2.0 * PI * (fundamental * multiple) * t).sin();
+            }
+        }
+
+        // Normalize
+        let max_amp = sample.iter().map(|x| x.abs()).fold(0.0, f64::max);
+        sample.iter_mut().for_each(|x| *x /= max_amp);
+
+        sample
+    }
+
     #[test]
     fn sanity_basic_sine() {
         let sample = produce_sample(12, 4.0, 0.0);
         let yin = Yin::init(0.1, 2.0, 5.0, 12);
         let computed_frequency = yin.estimate_freq(&sample).unwrap();
-        assert_within_tolerance(computed_frequency, 4.0, 1.0);
+        assert_within_tolerance!(computed_frequency, 4.0, 1.0);
     }
 
     #[test]
@@ -230,7 +259,7 @@ mod tests {
 
         let yin = Yin::init(0.1, 300.0, 1000.0, 44100);
         let computed_frequency = yin.estimate_freq(&combined_sample).unwrap();
-        assert_within_tolerance(computed_frequency, 400.0, 1.0);
+        assert_within_tolerance!(computed_frequency, 400.0, 1.0);
     }
 
     #[test]
@@ -238,7 +267,7 @@ mod tests {
         let sample = produce_sample(44100, 20.0, 0.0);
         let yin = Yin::init(0.1, 10.0, 100.0, 44100);
         let computed_frequency = yin.estimate_freq(&sample).unwrap();
-        assert_within_tolerance(computed_frequency, 20.0, 1.0);
+        assert_within_tolerance!(computed_frequency, 20.0, 1.0);
     }
 
     #[test]
@@ -255,7 +284,7 @@ mod tests {
         let sample = produce_sample(44100, 443.0, 0.0);
         let yin = Yin::init(0.1, 300.0, 500.0, 44100);
         let computed_frequency = yin.estimate_freq(&sample).unwrap();
-        assert_within_tolerance(computed_frequency, 443.0, 1.0);
+        assert_within_tolerance!(computed_frequency, 443.0, 1.0);
     }
 
     #[test]
@@ -273,6 +302,30 @@ mod tests {
         let result = yin.estimate_freq(&sample).unwrap();
         assert!(result.clarity < 0.8); // Noisy signal should have lower clarity
         println!("Noisy signal clarity: {}", result.clarity);
+    }
+
+    #[test]
+    fn test_missing_fundamental() {
+        // true fundamental is 220 Hz
+        let harmonics = vec![
+            (1.5, 1.0), // 1.5 * 440 = 660 Hz - so this is 220 * 3
+            (2.0, 0.9), // 880 Hz
+            (2.5, 0.8), // 1100 Hz
+            (3.0, 0.7), // 1320 Hz
+            (3.5, 0.6), // 1540 Hz
+            (4.0, 0.6), // 1760 Hz
+        ];
+        let sample = produce_complex_sample(44100, 440.0, &harmonics);
+
+        let yin = Yin::init(0.6, 200.0, 2000.0, 44100);
+
+        let result = yin.estimate_freq(&sample).unwrap();
+
+        assert_within_tolerance!(result, 220.0, 5.0);
+        println!(
+            "Missing fundamental test - Frequency: {}, Clarity: {}",
+            result.frequency, result.clarity
+        );
     }
 
     #[test]
@@ -298,6 +351,6 @@ mod tests {
             }
         }
         let freq = estimator.estimate_freq(&example).unwrap();
-        assert_within_tolerance(freq, 20.0, 1.0);
+        assert_within_tolerance!(freq, 20.0, 1.0);
     }
 }
